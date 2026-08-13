@@ -2,6 +2,10 @@ import cv2
 import time
 from rpycrsf import Drone
 import numpy as np
+from ultralytics import YOLO
+
+# 모델 로드 (학습된 가중치 파일 best.pt 사용)
+model = YOLO('best.pt')
 
 # ==========================================
 # 설정 (Configuration)
@@ -32,32 +36,33 @@ THROTTLE_KP = 0.002 # 상승/하강 (목표물이 중심에서 위아래로 벗�
 # ==========================================
 def get_yolo_target(frame):
     """
-    영상 프레임에서 목표물을 찾아 중심 좌표와 크기를 반환합니다.
-    TODO: 실제 YOLOv8 추론 코드로 교체해야 합니다.
+    YOLOv8 모델을 사용하여 영상에서 타겟을 찾아 중심 좌표와 크기를 반환합니다.
     """
-    # -----------------------------------------------------
-    # 실제 구현 예시 (ultralytics YOLO 사용 시):
-    # results = model(frame, stream=True)
-    # for r in results:
-    #     boxes = r.boxes
-    #     for box in boxes:
-    #         # 원하는 클래스(예: 사람)인지 확인 후
-    #         x1, y1, x2, y2 = box.xyxy[0]
-    #         cx = int((x1 + x2) / 2)
-    #         cy = int((y1 + y2) / 2)
-    #         area = int((x2 - x1) * (y2 - y1))
-    #         return cx, cy, area, True
-    # return 0, 0, 0, False
-    # -----------------------------------------------------
-
-    # 현재는 테스트를 위해 화면 정중앙에 타겟이 있다고 가상의 데이터를 반환합니다.
-    # 마우스 클릭으로 타겟을 지정하는 등의 테스트 코드를 넣어도 좋습니다.
-    mock_found = True
-    mock_cx = 320
-    mock_cy = 240
-    mock_area = 15000
+    # YOLO 모델 추론 (stream=True로 하면 메모리 효율이 좋습니다)
+    results = model(frame, stream=True, verbose=False)
     
-    return mock_cx, mock_cy, mock_area, mock_found
+    for r in results:
+        boxes = r.boxes
+        if len(boxes) > 0:
+            # 탐지된 객체 중 첫 번째 객체를 추적합니다.
+            box = boxes[0] 
+            
+            # 바운딩 박스 좌표 추출
+            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+            
+            # 클래스 식별 (0: Can, 1: Plastic)
+            cls_id = int(box.cls[0].cpu().numpy())
+            target_name = "Can" if cls_id == 0 else "Plastic"
+            
+            # 중심점(cx, cy)과 면적(area) 계산
+            cx = int((x1 + x2) / 2)
+            cy = int((y1 + y2) / 2)
+            area = int((x2 - x1) * (y2 - y1))
+            
+            return cx, cy, area, True, target_name
+            
+    # 탐지된 객체가 없으면 False 반환
+    return 0, 0, 0, False, ""
 
 # ==========================================
 # 메인 제어 루프
@@ -99,7 +104,7 @@ def main():
                     break
                 
                 # 영상에서 타겟 찾기
-                cx, cy, area, found = get_yolo_target(frame)
+                cx, cy, area, found, target_name = get_yolo_target(frame)
 
                 # 스틱 제어 변수 초기화 (매 프레임 0으로 초기화)
                 roll, pitch, yaw, throttle = 0.0, 0.0, 0.0, base_throttle
@@ -117,9 +122,9 @@ def main():
                     # 스로틀은 기본값에 오차를 더해줍니다. 0.0 ~ 1.0 사이 제한
                     throttle = max(0.0, min(1.0, base_throttle + (error_y * THROTTLE_KP)))
                     
-                    # 화면에 추적 상태 표시
+                    # 화면에 추적 상태 및 객체 종류 표시
                     cv2.circle(frame, (cx, cy), 10, (0, 255, 0), -1)
-                    cv2.putText(frame, f"Tracking", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                    cv2.putText(frame, f"Tracking: {target_name}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
                     
                 else:
                     # 타겟을 잃어버렸을 때: 제자리 호버링 대기
