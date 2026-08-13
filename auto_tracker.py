@@ -59,18 +59,30 @@ TARGET_BIN_ID = 0
 # ==========================================
 def get_yolo_target(frame):
     """ YOLO 모델을 이용해 캔(0)과 플라스틱(1)의 중심점 및 면적 반환 """
-    # conf=0.7을 추가하여 모델이 70% 이상 확신할 때만 인식하도록 기준을 높입니다. (오탐지 획기적 감소)
+    # conf=0.65로 약간 낮추되, 아래에서 크기와 비율로 안전 필터링 적용
     results = model(frame, stream=True, verbose=False, conf=0.65)
     for r in results:
         boxes = r.boxes
         if len(boxes) > 0:
             box = boxes[0] 
             x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+            
+            w = int(x2 - x1)
+            h = int(y2 - y1)
+            area = w * h
+            
+            # 🚨 [안전 장치 1] 객체가 화면의 40% 이상을 차지할 정도로 너무 크면 무시 (사람 접근 방지)
+            if area > (FRAME_WIDTH * FRAME_HEIGHT) * 0.4:
+                continue
+                
+            # 🚨 [안전 장치 2] 세로가 가로보다 2배 이상 길면 사람(또는 다리)으로 간주하고 무시
+            if h > w * 2.0:
+                continue
+
             cls_id = int(box.cls[0].cpu().numpy())
             target_name = "Can" if cls_id == 0 else "Plastic"
             cx = int((x1 + x2) / 2)
             cy = int((y1 + y2) / 2)
-            area = int((x2 - x1) * (y2 - y1))
             return cx, cy, area, True, target_name
     return 0, 0, 0, False, ""
 
