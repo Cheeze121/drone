@@ -11,8 +11,8 @@ from ultralytics import YOLO
 # ==========================================
 # 1. 설정 (Configuration)
 # ==========================================
-TEST_MODE = True           # 가상 드론 모드 (True: 드론 미연결 시 오류 무시)
-USE_SCREEN_CAPTURE = False # 화면 캡처 사용 여부 (False: 웹캠 사용)
+TEST_MODE = True           
+USE_SCREEN_CAPTURE = False 
 
 CAMERA_ID = 0
 FRAME_WIDTH = 640
@@ -21,15 +21,18 @@ TARGET_FPS = 30
 CENTER_X = FRAME_WIDTH // 2
 CENTER_Y = FRAME_HEIGHT // 2
 
-# 객체 접근 기준 면적 (이 크기가 되면 도착한 것으로 간주)
-TARGET_TRASH_AREA = 25000  # 쓰레기
-TARGET_BIN_AREA = 15000    # 쓰레기통(마커)
+TARGET_TRASH_AREA = 25000  
+TARGET_BIN_AREA = 15000    
 
-# 드론 비행 PID 제어 상수
 YAW_KP = 0.0015
 PITCH_KP = 0.00005
 THROTTLE_KP = 0.002
 BASE_THROTTLE = 0.5 
+
+# 고급 비행 제어 설정 (Jitter 방지 및 유예 시간)
+DEADZONE_X = 30     # 좌우 데드존 (픽셀)
+DEADZONE_Y = 20     # 상하 데드존 (픽셀)
+GRACE_PERIOD = 1.5  # 목표물 분실 시 유예 시간 (초)
 
 # ==========================================
 # 2. 드론 상태 (State Machine)
@@ -46,7 +49,6 @@ STATE_DONE            = "Mission Complete"
 # 3. 비전 인공지능 (YOLO & ArUco) 초기화
 # ==========================================
 model = YOLO('best.pt')
-
 aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
 aruco_params = cv2.aruco.DetectorParameters()
 aruco_detector = cv2.aruco.ArucoDetector(aruco_dict, aruco_params)
@@ -107,6 +109,21 @@ class DummyDrone:
     def set_sticks(self, **kwargs): pass
     def send(self): pass
 
+def apply_pid(cx, cy, area, target_area):
+    """ 데드존이 적용된 PID 제어값 계산 """
+    error_x = cx - CENTER_X
+    error_y = CENTER_Y - cy
+    error_area = target_area - area
+
+    # 데드존 이내이면 오차를 0으로 무시하여 드론의 흔들림 방지
+    if abs(error_x) < DEADZONE_X: error_x = 0
+    if abs(error_y) < DEADZONE_Y: error_y = 0
+
+    yaw = max(-1.0, min(1.0, error_x * YAW_KP))
+    pitch = max(-1.0, min(1.0, error_area * PITCH_KP))
+    throttle = max(0.0, min(1.0, BASE_THROTTLE + (error_y * THROTTLE_KP)))
+    return yaw, pitch, throttle
+
 # ==========================================
 # 5. 메인 루프 (Main Loop)
 # ==========================================
@@ -123,6 +140,9 @@ def main():
 
     current_state = STATE_SEARCHING_TRASH
     drone_context = DummyDrone() if (TEST_MODE or Drone is None) else Drone("/dev/serial0")
+
+    last_seen_time = 0
+    last_seen_cx = CENTER_X
 
     try:
         with drone_context as drone:
@@ -147,37 +167,48 @@ def main():
                     cx, cy, area, found, target_name = get_yolo_target(frame)
                     if found:
                         current_state = STATE_TRACKING_TRASH
+                        last_seen_time = time.time()
+                        last_seen_cx = cx
                         cv2.circle(frame, (cx, cy), 10, (0, 255, 0), -1)
-                        yaw = max(-1.0, min(1.0, (cx - CENTER_X) * YAW_KP))
-                        pitch = max(-1.0, min(1.0, (TARGET_TRASH_AREA - area) * PITCH_KP))
-                        throttle = max(0.0, min(1.0, BASE_THROTTLE + ((CENTER_Y - cy) * THROTTLE_KP)))
+                        
+                        yaw, pitch, throttle = apply_pid(cx, cy, area, TARGET_TRASH_AREA)
                         
                         if area > TARGET_TRASH_AREA * 0.9:
                             current_state = STATE_PICKING_UP
                     else:
-                        current_state = STATE_SEARCHING_TRASH
-                        yaw = 0.15
+                        if time.time() - last_seen_time < GRACE_PERIOD:
+                            # 1.5초 유예 시간 동안, 사라진 방향으로 계속 고개 돌리기
+                            yaw = -0.15 if last_seen_cx < CENTER_X else 0.15
+                        else:
+                            # 유예 시간이 지나면 완전한 탐색 모드로 전환
+                            current_state = STATE_SEARCHING_TRASH
+                            yaw = 0.15
 
                 elif current_state == STATE_PICKING_UP:
                     drone.set_sticks(roll=0, pitch=0, yaw=0, throttle=BASE_THROTTLE)
                     drone.send()
                     pickup_trash()
                     current_state = STATE_SEARCHING_BIN
+                    last_seen_time = 0 
 
                 elif current_state in [STATE_SEARCHING_BIN, STATE_TRACKING_BIN]:
                     cx, cy, area, found = get_aruco_target(frame)
                     if found:
                         current_state = STATE_TRACKING_BIN
+                        last_seen_time = time.time()
+                        last_seen_cx = cx
                         cv2.circle(frame, (cx, cy), 10, (255, 0, 0), -1)
-                        yaw = max(-1.0, min(1.0, (cx - CENTER_X) * YAW_KP))
-                        pitch = max(-1.0, min(1.0, (TARGET_BIN_AREA - area) * PITCH_KP))
-                        throttle = max(0.0, min(1.0, BASE_THROTTLE + ((CENTER_Y - cy) * THROTTLE_KP)))
+                        
+                        yaw, pitch, throttle = apply_pid(cx, cy, area, TARGET_BIN_AREA)
                         
                         if area > TARGET_BIN_AREA * 0.9:
                             current_state = STATE_DROPPING_OFF
                     else:
-                        current_state = STATE_SEARCHING_BIN
-                        yaw = 0.15
+                        if time.time() - last_seen_time < GRACE_PERIOD:
+                            yaw = -0.15 if last_seen_cx < CENTER_X else 0.15
+                        else:
+                            current_state = STATE_SEARCHING_BIN
+                            yaw = 0.15
 
                 elif current_state == STATE_DROPPING_OFF:
                     drone.set_sticks(roll=0, pitch=0, yaw=0, throttle=BASE_THROTTLE)
@@ -191,6 +222,10 @@ def main():
 
                 if current_state not in [STATE_PICKING_UP, STATE_DROPPING_OFF]:
                     drone.set_sticks(roll=roll, pitch=pitch, yaw=yaw, throttle=throttle)
+                
+                # 데드존 사각형 시각화 (화면 중앙 하얀 박스)
+                cv2.rectangle(frame, (CENTER_X - DEADZONE_X, CENTER_Y - DEADZONE_Y), 
+                                     (CENTER_X + DEADZONE_X, CENTER_Y + DEADZONE_Y), (255, 255, 255), 1)
                 
                 cv2.putText(frame, f"State: {current_state}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
                 cv2.imshow("Drone Tracker", frame)
