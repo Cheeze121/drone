@@ -59,7 +59,8 @@ TARGET_BIN_ID = 0
 # ==========================================
 def get_yolo_target(frame):
     """ YOLO 모델을 이용해 캔(0)과 플라스틱(1)의 중심점 및 면적 반환 """
-    results = model(frame, stream=True, verbose=False)
+    # conf=0.7을 추가하여 모델이 70% 이상 확신할 때만 인식하도록 기준을 높입니다. (오탐지 획기적 감소)
+    results = model(frame, stream=True, verbose=False, conf=0.7)
     for r in results:
         boxes = r.boxes
         if len(boxes) > 0:
