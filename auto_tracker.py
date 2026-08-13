@@ -70,14 +70,6 @@ def get_yolo_target(frame):
             w = int(x2 - x1)
             h = int(y2 - y1)
             area = w * h
-            
-            # 🚨 [안전 장치 1] 객체가 화면의 40% 이상을 차지할 정도로 너무 크면 무시 (사람 접근 방지)
-            if area > (FRAME_WIDTH * FRAME_HEIGHT) * 0.4:
-                continue
-                
-            # 🚨 [안전 장치 2] 세로가 가로보다 2배 이상 길면 사람(또는 다리)으로 간주하고 무시
-            if h > w * 2.0:
-                continue
 
             cls_id = int(box.cls[0].cpu().numpy())
             target_name = "Can" if cls_id == 0 else "Plastic"
