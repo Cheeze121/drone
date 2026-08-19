@@ -1,5 +1,6 @@
 import cv2
 import time
+import threading
 import numpy as np
 import mss
 
@@ -10,13 +11,19 @@ except ImportError:
     Drone = None
     GPIO = None
 
+try:
+    from picamera2 import Picamera2
+except ImportError:
+    Picamera2 = None
+
 from ultralytics import YOLO
 
 # ==========================================
-# 1. 설정 (Configuration)
+# 1. Configuration
 # ==========================================
-TEST_MODE = True           
-USE_SCREEN_CAPTURE = False 
+TEST_MODE = False
+USE_SCREEN_CAPTURE = False
+USE_PICAMERA2 = Picamera2 is not None  # True when using a Raspberry Pi CSI camera (e.g. imx219)
 
 CAMERA_ID = 0
 FRAME_WIDTH = 640
@@ -33,22 +40,31 @@ PITCH_KP = 0.00005
 THROTTLE_KP = 0.002
 BASE_THROTTLE = 0.5 
 
-# 고급 비행 제어 설정 (Jitter 방지 및 유예 시간)
-DEADZONE_X = 30     # 좌우 데드존 (픽셀)
-DEADZONE_Y = 20     # 상하 데드존 (픽셀)
-GRACE_PERIOD = 1.5  # 목표물 분실 시 유예 시간 (초)
+# Advanced flight control settings (jitter prevention and grace period)
+DEADZONE_X = 30     # Left/right deadzone (pixels)
+DEADZONE_Y = 20     # Up/down deadzone (pixels)
+GRACE_PERIOD = 1.5  # Grace period after losing the target (seconds)
+
+# Stop-and-look search sweep: turn briefly, then hold still so the vision thread can get a
+# clean (non-blurred) frame and finish a detection cycle before turning again.
+SEARCH_TURN_DURATION = 0.4  # Time spent turning per sweep (seconds)
+SEARCH_PAUSE_DURATION = 1.5 # Time spent holding still per sweep (seconds) - covers a full YOLO cycle (~1.1s)
+
+PRE_ARM_DELAY = 10.0   # Wait this long after startup before arming/taking off (seconds)
+LANDING_DURATION = 3.0 # Time to ramp throttle down to land on the trash (seconds)
+PICKUP_DWELL_TIME = 10.0 # Time to stay landed while picking up the trash (seconds)
 
 # ==========================================
-# 1-1. 초음파 센서 설정 (고도 유지)
+# 1-1. Ultrasonic sensor settings (altitude hold)
 # ==========================================
-USE_ULTRASONIC = True      # 초음파 센서 고도 유지 기능 사용 여부
-TRIG_PIN = 23              # 초음파 송신 핀 (BCM 번호)
-ECHO_PIN = 24              # 초음파 수신 핀 (BCM 번호)
-TARGET_ALTITUDE_CM = 50.0  # 유지할 목표 고도 (cm)
-ALTITUDE_KP = 0.005        # 초음파 고도 제어 PID 비례 상수
+USE_ULTRASONIC = True      # Whether to use the ultrasonic altitude hold feature
+TRIG_PIN = 23              # Ultrasonic trigger pin (BCM number)
+ECHO_PIN = 24              # Ultrasonic echo pin (BCM number)
+TARGET_ALTITUDE_CM = 50.0  # Target altitude to hold (cm)
+ALTITUDE_KP = 0.005        # Proportional constant for ultrasonic altitude PID control
 
 # ==========================================
-# 2. 드론 상태 (State Machine)
+# 2. Drone State (State Machine)
 # ==========================================
 STATE_SEARCHING_TRASH = "Search: Trash"
 STATE_TRACKING_TRASH  = "Track: Trash"
@@ -59,7 +75,7 @@ STATE_DROPPING_OFF    = "Action: Dropoff"
 STATE_DONE            = "Mission Complete"
 
 # ==========================================
-# 3. 비전 인공지능 (YOLO & ArUco) 초기화
+# 3. Vision AI (YOLO & ArUco) Initialization
 # ==========================================
 model = YOLO('best.pt')
 aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
@@ -68,27 +84,27 @@ aruco_detector = cv2.aruco.ArucoDetector(aruco_dict, aruco_params)
 TARGET_BIN_ID = 0
 
 # ==========================================
-# 4. 기능 함수 (Functions)
+# 4. Functions
 # ==========================================
 def get_yolo_target(frame):
-    """ YOLO 모델을 이용해 캔(0)과 플라스틱(1)의 중심점 및 면적 반환 """
-    # conf=0.65로 약간 낮추되, 아래에서 크기와 비율로 안전 필터링 적용
-    results = model(frame, stream=True, verbose=False, conf=0.65)
+    """ Returns the center point and area of a can(0) or plastic(1) using the YOLO model """
+    # Lowered to conf=0.1, with extra safety filtering below by size and aspect ratio
+    results = model(frame, stream=True, verbose=False, conf=0.1)
     for r in results:
         boxes = r.boxes
         if len(boxes) > 0:
-            box = boxes[0] 
+            box = boxes[0]
             x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-            
+
             w = int(x2 - x1)
             h = int(y2 - y1)
             area = w * h
-            
-            # 🚨 [안전 장치 1] 객체가 화면의 40% 이상을 차지할 정도로 너무 크면 무시 (사람 접근 방지)
+
+            # [Safety 1] Ignore if the object covers 40%+ of the frame (avoid approaching people)
             if area > (FRAME_WIDTH * FRAME_HEIGHT) * 0.4:
                 continue
-                
-            # 🚨 [안전 장치 2] 세로가 가로보다 2배 이상 길면 사람(또는 다리)으로 간주하고 무시
+
+            # [Safety 2] Ignore if height is more than 2x width (likely a person or legs)
             if h > w * 2.0:
                 continue
 
@@ -100,7 +116,7 @@ def get_yolo_target(frame):
     return 0, 0, 0, False, ""
 
 def get_aruco_target(frame):
-    """ OpenCV를 이용해 특정 ID의 ArUco 마커 중심점 및 면적 반환 """
+    """ Returns the center point and area of the target ArUco marker ID using OpenCV """
     corners, ids, rejected = aruco_detector.detectMarkers(frame)
     if ids is not None:
         for i, marker_id in enumerate(ids.flatten()):
@@ -109,51 +125,101 @@ def get_aruco_target(frame):
                 cx = int(np.mean(c[:, 0]))
                 cy = int(np.mean(c[:, 1]))
                 area = int(cv2.contourArea(c))
-                cv2.aruco.drawDetectedMarkers(frame, corners, ids)
                 return cx, cy, area, True
     return 0, 0, 0, False
 
+# ==========================================
+# 4-1. Background Vision Worker
+# ==========================================
+# YOLO inference alone takes ~1.1s per frame on this hardware. Running it inline in the
+# control loop would cap altitude/attitude updates at <1Hz, which is far too slow to hover.
+# This worker runs detection continuously in its own thread against whatever frame is newest,
+# so the control loop below is never blocked waiting on it.
+class SharedVision:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.latest_frame = None
+        self.mode = "trash"  # "trash" (YOLO) or "bin" (ArUco) requested by the control loop
+        self.result_mode = None  # mode the current cx/cy/area/found were actually computed under
+        self.cx, self.cy, self.area, self.found, self.name = 0, 0, 0, False, ""
+        self.stop = False
+
+def vision_worker(shared):
+    while not shared.stop:
+        with shared.lock:
+            frame = shared.latest_frame
+            mode = shared.mode
+        if frame is None:
+            time.sleep(0.01)
+            continue
+
+        if mode == "trash":
+            cx, cy, area, found, name = get_yolo_target(frame)
+        else:
+            cx, cy, area, found = get_aruco_target(frame)
+            name = ""
+
+        with shared.lock:
+            shared.cx, shared.cy, shared.area, shared.found, shared.name = cx, cy, area, found, name
+            shared.result_mode = mode
+
+_last_altitude = TARGET_ALTITUDE_CM
+_last_ping_time = 0.0
+ULTRASONIC_MIN_INTERVAL = 0.06  # HC-SR04 needs >=60ms between pings or echoes overlap and corrupt the reading
+ULTRASONIC_TIMEOUT = 0.25       # Long enough to cover the sensor's own "no echo" window (measured ~193ms on this unit)
+
 def get_altitude():
-    """ 초음파 센서로 바닥과의 거리를 측정하여 cm 단위로 반환 """
+    """ Measures the distance to the ground with the ultrasonic sensor and returns it in cm """
+    global _last_altitude, _last_ping_time
+
     if TEST_MODE or GPIO is None or not USE_ULTRASONIC:
-        return TARGET_ALTITUDE_CM # 테스트 환경에서는 항상 목표 고도에 있다고 가정
+        return TARGET_ALTITUDE_CM # Assume we're always at the target altitude in the test environment
+
+    now = time.time()
+    if now - _last_ping_time < ULTRASONIC_MIN_INTERVAL:
+        return _last_altitude # Too soon since the last ping; reuse the last known-good reading
+    _last_ping_time = now
 
     GPIO.output(TRIG_PIN, True)
     time.sleep(0.00001)
     GPIO.output(TRIG_PIN, False)
 
+    deadline = time.time() + ULTRASONIC_TIMEOUT
+
     start_time = time.time()
-    stop_time = time.time()
-    timeout = start_time + 0.1 # 무한 루프 방지용 타임아웃 (0.1초)
-
-    while GPIO.input(ECHO_PIN) == 0 and time.time() < timeout:
+    while GPIO.input(ECHO_PIN) == 0:
         start_time = time.time()
+        if start_time > deadline:
+            return _last_altitude # ECHO never went high; sensor unresponsive
 
-    while GPIO.input(ECHO_PIN) == 1 and time.time() < timeout:
+    stop_time = start_time
+    while GPIO.input(ECHO_PIN) == 1:
         stop_time = time.time()
+        if stop_time > deadline:
+            return _last_altitude # No echo received within range (open air, or sensor fault)
 
     elapsed = stop_time - start_time
-    distance = (elapsed * 34300) / 2 # 왕복 거리이므로 2로 나눔
+    distance = (elapsed * 34300) / 2 # Divide by 2 since it's a round trip distance
 
-    # 거리가 너무 튀는 경우(2cm 미만, 400cm 초과) 방어 코드
-    if distance < 2 or distance > 400:
-        return TARGET_ALTITUDE_CM
-    return distance
+    # Guard against distance spikes (under 2cm or over 400cm)
+    if 2 <= distance <= 400:
+        _last_altitude = distance
+    return _last_altitude
 
 def pickup_trash():
-    """ 쓰레기 수거 하드웨어 제어 """
+    """ Controls the trash pickup hardware """
     print("[HW] Pickup started...")
-    time.sleep(2)
+    time.sleep(PICKUP_DWELL_TIME)
     print("[HW] Pickup finished.")
 
 def dropoff_trash():
-    """ 쓰레기 배출 하드웨어 제어 """
+    """ Controls the trash dropoff hardware """
     print("[HW] Dropoff started...")
     time.sleep(2)
     print("[HW] Dropoff finished.")
 
 class DummyDrone:
-    """ PC 테스트용 가상 드론 클래스 """
+    """ Virtual drone class for PC testing """
     def __enter__(self): return self
     def __exit__(self, t, v, tb): pass
     def set_mode(self, val): pass
@@ -163,79 +229,145 @@ class DummyDrone:
     def send(self): pass
 
 def apply_pid(cx, cy, area, target_area, current_altitude):
-    """ 데드존 및 초음파 고도 제어가 적용된 PID 제어값 계산 """
+    """ Computes PID control values with deadzone and ultrasonic altitude control applied """
     error_x = cx - CENTER_X
     error_y = CENTER_Y - cy
     error_area = target_area - area
 
-    # 데드존 이내이면 오차를 0으로 무시하여 드론의 흔들림 방지
+    # Zero out the error within the deadzone to prevent drone jitter
     if abs(error_x) < DEADZONE_X: error_x = 0
     if abs(error_y) < DEADZONE_Y: error_y = 0
 
     yaw = max(-1.0, min(1.0, error_x * YAW_KP))
     pitch = max(-1.0, min(1.0, error_area * PITCH_KP))
-    
+
     if USE_ULTRASONIC:
-        # 초음파 센서 사용 시: 바닥과의 거리를 기준으로 스로틀 제어
+        # When using the ultrasonic sensor: control throttle based on distance to the ground
         error_altitude = TARGET_ALTITUDE_CM - current_altitude
         throttle = max(0.0, min(1.0, BASE_THROTTLE + (error_altitude * ALTITUDE_KP)))
     else:
-        # 미사용 시: 카메라 Y축 기준으로 스로틀 제어
+        # Otherwise: control throttle based on the camera's Y axis
         throttle = max(0.0, min(1.0, BASE_THROTTLE + (error_y * THROTTLE_KP)))
-        
+
     return yaw, pitch, throttle
 
+def search_sweep_yaw(phase_start):
+    """ Turn briefly, then hold still, repeating - so detection gets a clean frame instead of a
+    continuously blurred one. Returns (yaw, phase_start), where phase_start should be passed back
+    in on the next call and reset to None whenever a new search sweep should start fresh. """
+    if phase_start is None:
+        phase_start = time.time()
+    cycle = SEARCH_TURN_DURATION + SEARCH_PAUSE_DURATION
+    phase_time = (time.time() - phase_start) % cycle
+    yaw = 0.15 if phase_time < SEARCH_TURN_DURATION else 0.0
+    return yaw, phase_start
+
+def land_on_target(drone):
+    """ Ramps throttle down to land in place, holding roll/pitch/yaw level """
+    print("[FLIGHT] Landing...")
+    steps = 30
+    for i in range(steps, -1, -1):
+        throttle = BASE_THROTTLE * (i / steps)
+        drone.set_sticks(roll=0, pitch=0, yaw=0, throttle=throttle)
+        drone.send()
+        time.sleep(LANDING_DURATION / steps)
+    drone.set_sticks(roll=0, pitch=0, yaw=0, throttle=0.0)
+    drone.send()
+    print("[FLIGHT] Landed.")
+
 # ==========================================
-# 5. 메인 루프 (Main Loop)
+# 5. Main Loop
 # ==========================================
 def main():
-    if not USE_SCREEN_CAPTURE:
+    if USE_SCREEN_CAPTURE:
+        sct = mss.mss()
+        monitor = sct.monitors[1]
+    elif USE_PICAMERA2:
+        picam2 = Picamera2()
+        picam2_config = picam2.create_video_configuration(
+            main={"size": (FRAME_WIDTH, FRAME_HEIGHT), "format": "RGB888"}
+        )
+        picam2.configure(picam2_config)
+        picam2.start()
+    else:
         cap = cv2.VideoCapture(CAMERA_ID)
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
         if not cap.isOpened():
             return
-    else:
-        sct = mss.mss()
-        monitor = sct.monitors[1]
 
     current_state = STATE_SEARCHING_TRASH
     drone_context = DummyDrone() if (TEST_MODE or Drone is None) else Drone("/dev/serial0")
+    if hasattr(drone_context, "ser"):
+        # rpycrsf hardcodes write_timeout=0.1s, which is too tight while the
+        # CPU-heavy YOLO thread is running and can starve the writer thread's
+        # scheduling. Loosen it so transient scheduling delays don't trip
+        # SerialTimeoutException spam (still caught internally either way).
+        drone_context.ser.write_timeout = 1.0
 
-    # 초음파 센서 GPIO 초기화
+    # Initialize ultrasonic sensor GPIO
     if USE_ULTRASONIC and not TEST_MODE and GPIO is not None:
         GPIO.setmode(GPIO.BCM)
         GPIO.setup(TRIG_PIN, GPIO.OUT)
-        GPIO.setup(ECHO_PIN, GPIO.IN)
+        GPIO.setup(ECHO_PIN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
         GPIO.output(TRIG_PIN, False)
-        print("✅ 초음파 센서 (HC-SR04) 핀 설정 완료")
+        time.sleep(0.5) # Let the sensor settle before the first ping
+        print("Ultrasonic sensor (HC-SR04) pin setup complete")
 
     last_seen_time = 0
     last_seen_cx = CENTER_X
+    search_phase_start = None
+
+    shared_vision = SharedVision()
+    vision_thread = threading.Thread(target=vision_worker, args=(shared_vision,), daemon=True)
+    vision_thread.start()
 
     try:
         with drone_context as drone:
-            drone.set_mode(True)   
+            drone.set_mode(True)
             drone.set_althold(True)
-            drone.arm(True)        
+
+            print(f"[FLIGHT] Arming in {PRE_ARM_DELAY:.0f}s...")
+            countdown_start = time.time()
+            while time.time() - countdown_start < PRE_ARM_DELAY:
+                remaining = PRE_ARM_DELAY - (time.time() - countdown_start)
+                print(f"[FLIGHT] Takeoff in {remaining:.0f}s")
+                time.sleep(1)
+            drone.arm(True)
+            print("[FLIGHT] Armed. Taking off.")
 
             while True:
-                if not USE_SCREEN_CAPTURE:
-                    ret, frame = cap.read()
-                    if not ret: break
-                else:
+                if USE_SCREEN_CAPTURE:
                     sct_img = sct.grab(monitor)
                     frame = np.array(sct_img)
                     frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
                     frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
+                elif USE_PICAMERA2:
+                    frame = picam2.capture_array()
+                else:
+                    ret, frame = cap.read()
+                    if not ret: break
                 
                 roll, pitch, yaw, throttle = 0.0, 0.0, 0.0, BASE_THROTTLE
-                
-                # --- 상태 분기 ---
-                current_altitude = get_altitude() # 매 프레임마다 초음파 센서로 현재 고도 측정
+
+                # Hand the newest frame to the background vision thread and pull its latest result.
+                # Detection runs asynchronously (~1fps) so it never blocks this control loop.
+                requested_mode = "trash" if current_state in [STATE_SEARCHING_TRASH, STATE_TRACKING_TRASH] else "bin"
+                with shared_vision.lock:
+                    shared_vision.latest_frame = frame.copy()
+                    shared_vision.mode = requested_mode
+                    cx, cy, area, found, target_name = (
+                        shared_vision.cx, shared_vision.cy, shared_vision.area,
+                        shared_vision.found, shared_vision.name,
+                    )
+                    # Ignore a result still left over from before we switched detection modes
+                    if shared_vision.result_mode != requested_mode:
+                        found = False
+
+                # --- State branching ---
+                current_altitude = get_altitude() # Measure current altitude with the ultrasonic sensor every frame
 
                 if current_state in [STATE_SEARCHING_TRASH, STATE_TRACKING_TRASH]:
-                    cx, cy, area, found, target_name = get_yolo_target(frame)
                     if found:
                         current_state = STATE_TRACKING_TRASH
                         last_seen_time = time.time()
@@ -248,27 +380,28 @@ def main():
                             current_state = STATE_PICKING_UP
                     else:
                         if time.time() - last_seen_time < GRACE_PERIOD:
-                            # 1.5초 유예 시간 동안, 사라진 방향으로 계속 고개 돌리기
+                            # During the grace period, keep turning toward the direction it disappeared
                             yaw = -0.15 if last_seen_cx < CENTER_X else 0.15
+                            search_phase_start = None # Reset so a fresh sweep starts once the grace period ends
                         else:
-                            # 유예 시간이 지나면 완전한 탐색 모드로 전환
+                            # Once the grace period ends, switch to a stop-and-look search sweep
                             current_state = STATE_SEARCHING_TRASH
-                            yaw = 0.15
-                            
-                        # 탐색 중에도 초음파 센서를 사용해 목표 고도를 일정하게 유지
+                            yaw, search_phase_start = search_sweep_yaw(search_phase_start)
+
+                        # Keep holding the target altitude with the ultrasonic sensor even while searching
                         if USE_ULTRASONIC:
                             error_altitude = TARGET_ALTITUDE_CM - current_altitude
                             throttle = max(0.0, min(1.0, BASE_THROTTLE + (error_altitude * ALTITUDE_KP)))
 
                 elif current_state == STATE_PICKING_UP:
-                    drone.set_sticks(roll=0, pitch=0, yaw=0, throttle=BASE_THROTTLE)
-                    drone.send()
+                    land_on_target(drone)
+                    drone.arm(False)
                     pickup_trash()
+                    drone.arm(True)
                     current_state = STATE_SEARCHING_BIN
-                    last_seen_time = 0 
+                    last_seen_time = 0
 
                 elif current_state in [STATE_SEARCHING_BIN, STATE_TRACKING_BIN]:
-                    cx, cy, area, found = get_aruco_target(frame)
                     if found:
                         current_state = STATE_TRACKING_BIN
                         last_seen_time = time.time()
@@ -282,11 +415,12 @@ def main():
                     else:
                         if time.time() - last_seen_time < GRACE_PERIOD:
                             yaw = -0.15 if last_seen_cx < CENTER_X else 0.15
+                            search_phase_start = None # Reset so a fresh sweep starts once the grace period ends
                         else:
                             current_state = STATE_SEARCHING_BIN
-                            yaw = 0.15
-                        
-                        # 탐색 중에도 초음파 센서를 사용해 목표 고도를 일정하게 유지
+                            yaw, search_phase_start = search_sweep_yaw(search_phase_start)
+
+                        # Keep holding the target altitude with the ultrasonic sensor even while searching
                         if USE_ULTRASONIC:
                             error_altitude = TARGET_ALTITUDE_CM - current_altitude
                             throttle = max(0.0, min(1.0, BASE_THROTTLE + (error_altitude * ALTITUDE_KP)))
@@ -304,7 +438,7 @@ def main():
                 if current_state not in [STATE_PICKING_UP, STATE_DROPPING_OFF]:
                     drone.set_sticks(roll=roll, pitch=pitch, yaw=yaw, throttle=throttle)
                 
-                # 데드존 사각형 시각화 (화면 중앙 하얀 박스)
+                # Visualize the deadzone rectangle (white box in the center of the frame)
                 cv2.rectangle(frame, (CENTER_X - DEADZONE_X, CENTER_Y - DEADZONE_Y), 
                                      (CENTER_X + DEADZONE_X, CENTER_Y + DEADZONE_Y), (255, 255, 255), 1)
                 
@@ -323,7 +457,11 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        if not USE_SCREEN_CAPTURE:
+        shared_vision.stop = True
+        vision_thread.join(timeout=2)
+        if USE_PICAMERA2 and not USE_SCREEN_CAPTURE:
+            picam2.stop()
+        elif not USE_SCREEN_CAPTURE:
             cap.release()
         cv2.destroyAllWindows()
         if USE_ULTRASONIC and not TEST_MODE and GPIO is not None:
